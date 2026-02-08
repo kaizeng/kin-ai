@@ -9,7 +9,7 @@ import matplotlib.dates as mdates
 from matplotlib.patches import FancyBboxPatch
 from datetime import datetime
 
-from kin_ai.src.data import get_price_data
+from kin_ai.src.data import get_price_data, get_dividend_data
 from kin_ai.src.strategy import calibrate_etf_plan
 from kin_ai.src.backtest import backtest_lump_sum
 from kin_ai.src.regime import detect_market_regime, infer_economic_cycle
@@ -22,6 +22,8 @@ END = "2025-12-31"
 INITIAL_CASH = 10_000.0
 REBALANCE_FREQ = "QE"
 METHOD = "risk_parity"
+REINVEST_DIVIDENDS = True      # True = reinvest, False = cash out
+RISK_FREE_RATE = 0.045         # annualised risk-free rate (4.5 %)
 
 
 def main() -> None:
@@ -29,32 +31,51 @@ def main() -> None:
     print("  Kin-AI  –  Investment Research Pipeline")
     print("=" * 60)
 
-    # 1. Fetch prices
-    print(f"\n[1/5] Downloading prices for {TICKERS} ({START} → {END}) …")
-    prices = get_price_data(TICKERS, start=START, end=END)
+    # 1. Fetch prices (adjusted for splits only, not dividends)
+    print(f"\n[1/6] Downloading prices for {TICKERS} ({START} → {END}) …")
+    prices = get_price_data(TICKERS, start=START, end=END, auto_adjust=True)
     print(f"      Got {len(prices)} trading days, {len(prices.columns)} tickers.")
 
-    # 2. Calibrate strategy
-    print(f"\n[2/5] Calibrating weights (method={METHOD}) …")
+    # 2. Fetch dividends
+    div_mode = "reinvest" if REINVEST_DIVIDENDS else "cash out"
+    print(f"\n[2/6] Downloading dividend history (mode: {div_mode}) …")
+    dividends = get_dividend_data(TICKERS, start=START, end=END)
+    total_div_events = (dividends > 0).sum().sum()
+    print(f"      Found {total_div_events} ex-dividend events across {len(TICKERS)} tickers.")
+
+    # 3. Calibrate strategy
+    print(f"\n[3/6] Calibrating weights (method={METHOD}) …")
     weights = calibrate_etf_plan(prices, method=METHOD)
     for t, w in sorted(weights.items(), key=lambda x: -x[1]):
         print(f"      {t:>5s}  {w:6.2%}")
 
-    # 3. Backtest
-    print(f"\n[3/5] Backtesting lump-sum ${INITIAL_CASH:,.0f}, rebalance every {REBALANCE_FREQ} …")
-    portfolio, weight_history = backtest_lump_sum(prices, weights, INITIAL_CASH, REBALANCE_FREQ)
+    # 4. Backtest
+    print(f"\n[4/6] Backtesting lump-sum ${INITIAL_CASH:,.0f}, rebalance every {REBALANCE_FREQ} …")
+    result = backtest_lump_sum(
+        prices, weights, INITIAL_CASH, REBALANCE_FREQ,
+        dividends=dividends,
+        reinvest_dividends=REINVEST_DIVIDENDS,
+    )
+    portfolio = result.portfolio
+    weight_history = result.weights
+    total_divs = result.total_dividends
+    dividend_cash = result.dividend_cash
+
     print(f"      Final value: ${portfolio.iloc[-1]:,.2f}")
     total_return = (portfolio.iloc[-1] / INITIAL_CASH - 1) * 100
     print(f"      Total return: {total_return:.1f}%")
+    print(f"      Total dividends received: ${total_divs:,.2f}")
+    if not REINVEST_DIVIDENDS:
+        print(f"      Dividend cash balance: ${dividend_cash.iloc[-1]:,.2f}")
 
-    # 4. Detect regime
-    print("\n[4/5] Detecting market regime (SPY) …")
+    # 5. Detect regime
+    print("\n[5/6] Detecting market regime (SPY) …")
     trend, vol = detect_market_regime(prices["SPY"])
     cycle = infer_economic_cycle(trend, vol)
     print(f"      Trend: {trend}  |  Volatility: {vol}  |  Cycle: {cycle}")
 
-    # 5. Generate advice
-    print("\n[5/5] Generating allocation advice …")
+    # 6. Generate advice
+    print("\n[6/6] Generating allocation advice …")
     advice = generate_advice(trend, cycle, weights)
     print(f"      Action: {advice['action']}")
     print("      Suggested weights:")
@@ -68,8 +89,16 @@ def main() -> None:
 
     total_return = (portfolio.iloc[-1] / INITIAL_CASH - 1) * 100
     cagr = ((portfolio.iloc[-1] / INITIAL_CASH) ** (1 / years) - 1) * 100
-    ann_vol = returns.std() * np.sqrt(252) * 100
-    sharpe = (cagr - 4.5) / ann_vol if ann_vol > 0 else 0  # ~risk-free 4.5%
+
+    # Annualised volatility & Sharpe — standard ex-post formulas
+    daily_mean = returns.mean()
+    daily_std = returns.std()
+    ann_return = daily_mean * 252          # annualised mean return (decimal)
+    ann_vol_dec = daily_std * np.sqrt(252) # annualised vol (decimal)
+    ann_vol = ann_vol_dec * 100            # for display (%)
+    sharpe = ((ann_return - RISK_FREE_RATE) / ann_vol_dec
+              if ann_vol_dec > 0 else 0.0)
+
     cummax = portfolio.cummax()
     drawdown = (portfolio - cummax) / cummax
     max_dd = drawdown.min() * 100
@@ -79,6 +108,7 @@ def main() -> None:
     best_day = returns.max() * 100
     worst_day = returns.min() * 100
     win_rate = (returns > 0).sum() / len(returns) * 100
+    div_yield = (total_divs / INITIAL_CASH / years) * 100  # avg annual div yield on cost
 
     # ── Bloomberg-style chart ──────────────────────────────────
     print("\n      Saving portfolio chart to portfolio.png …")
@@ -280,6 +310,12 @@ def main() -> None:
     _stat("Best Day", f"{best_day:+.2f}%", GREEN)
     _stat("Worst Day", f"{worst_day:+.2f}%", RED)
     _stat("Win Rate", f"{win_rate:.1f}%", GREEN if win_rate > 50 else RED, win_rate / 100)
+    _stat("Dividends", f"${total_divs:,.0f}", CYAN)
+    _stat("Div Yield (cost)", f"{div_yield:.2f}%", CYAN if div_yield > 0 else MUTED)
+    _stat("Div Mode", "REINVEST" if REINVEST_DIVIDENDS else "CASH OUT",
+          GREEN if REINVEST_DIVIDENDS else ORANGE)
+    if not REINVEST_DIVIDENDS:
+        _stat("Div Cash Bal", f"${dividend_cash.iloc[-1]:,.0f}", ORANGE)
     _stat("Trading Days", f"{trading_days:,}", WHITE)
 
     # ── Allocation section ─────────────────────────────────────
@@ -321,6 +357,7 @@ def main() -> None:
         0.0, 0.5,
         f"TICKERS:  {tickers_str}     │     PERIOD: {START} → {END}"
         f"     │     INITIAL: ${INITIAL_CASH:,.0f}     │     REBAL: {REBALANCE_FREQ}"
+        f"     │     DIVIDENDS: {'REINVEST' if REINVEST_DIVIDENDS else 'CASH OUT'}"
         f"     │     METHOD: {METHOD.upper().replace('_', ' ')}",
         fontsize=8, color=MUTED, va="center", fontfamily="monospace",
     )
