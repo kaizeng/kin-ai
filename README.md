@@ -1,61 +1,152 @@
 # Kin-AI
 
-Personal investment research pipeline for long-term ETF portfolio construction, backtesting, and tactical allocation using market regime detection.
+Personal investment research pipeline for long-term ETF portfolio construction with **alpha-driven automatic ETF selection**, backtesting, and tactical allocation using market regime detection.
+
+---
+
+## Sample Output
+
+![Portfolio Analytics Chart](portfolio.png)
 
 ---
 
 ## Features
 
+- **Max-Sharpe / min-drawdown optimisation** — Monte-Carlo weight optimizer that maximises Sharpe ratio while penalising drawdown, with a 40 % single-asset concentration cap
+- **Alpha-driven ETF selection** — multi-factor model automatically picks the best 3–4 ETFs at each rebalance from a universe of ~71 ETFs
+- **SQLite cache** — prices, dividends, and universe data are cached locally for fast reruns
+- **Broad ETF universe** — ~71 ETFs across 8 asset classes (US equity, intl equity, fixed income, commodities, real estate, alternatives, income, dividend)
 - **Yahoo Finance data access** — automated daily close-price download via `yfinance`
 - **Dividend tracking** — fetches per-share dividends with option to reinvest or cash out
-- **Risk-parity weight calibration** — inverse-volatility target allocation
-- **Lump-sum backtesting** — periodic rebalancing with full weight-drift tracking
+- **Lump-sum backtesting** — periodic rebalancing with dynamic portfolio rotation and full weight-drift tracking
 - **Market regime detection** — trend + volatility classification via moving averages
 - **Tactical allocation advice** — risk-on / risk-off tilts based on regime & cycle
-- **Bloomberg-style analytics chart** — portfolio value, allocation weights, drawdown, key stats, and dividend info
+- **Bloomberg-style analytics chart** — portfolio value, allocation weights with per-rebalance annotations, drawdown, dividends, key stats
 
 ---
 
 ## Pipeline Overview
 
-The pipeline runs six steps in sequence:
+The pipeline runs eight steps in sequence:
 
 ```
-[1] Data        →  Download daily prices from Yahoo Finance
-[2] Dividends   →  Fetch per-share dividend history for all tickers
-[3] Strategy    →  Calibrate target ETF weights (risk-parity or equal-weight)
-[4] Backtest    →  Simulate lump-sum investment with quarterly rebalancing + dividends
-[5] Regime      →  Detect current market regime (trend + volatility)
-[6] Advice      →  Generate tactical allocation tilt
+[1] Universe / Prices →  Load ETF universe, download daily prices (cache-first)
+[2] Dividends         →  Fetch per-share dividend history for all tickers
+[3] Alpha Scoring     →  Run multi-factor alpha model, pick top N ETFs
+[4] Backtest          →  Simulate lump-sum investment with periodic rebalancing
+[5] Regime            →  Detect current market regime (trend + volatility)
+[6] Advice            →  Generate tactical allocation tilt
+[7] Chart             →  Render Bloomberg-style portfolio analytics chart
+[8] Summary           →  Print final results
 ```
+
+### Operating Modes
+
+| Mode | Description |
+|------|-------------|
+| **Auto-Select** (`AUTO_SELECT = True`) | Alpha model scores all ETFs in the universe, picks the top `TOP_N` at each rebalance, and allocates using max-Sharpe optimised weights. Different ETFs may be held in different periods. |
+| **Manual** (`AUTO_SELECT = False`) | Uses a fixed list of tickers (`TICKERS`) with weights from `calibrate_etf_plan()`. |
 
 ### Default Parameters
 
 | Parameter             | Value                              |
 |-----------------------|------------------------------------|
-| Tickers               | SPY, QQQ, IWM, AGG, GLD           |
-| Period                | 2015-01-01 → 2025-12-31           |
+| Mode                  | Manual                             |
+| Tickers (manual mode) | HYG, TLH, JEPQ, JEPI, QQQ         |
+| Top N (auto mode)     | 4 ETFs per rebalance               |
+| Max weight            | 40 % (concentration cap)           |
+| Min history           | 200 trading days                   |
+| Period                | 2020-01-01 → 2026-02-07           |
 | Initial capital       | $10,000                            |
-| Rebalance freq        | Quarterly (QE)                     |
-| Weight method         | Risk parity (inverse-volatility)   |
+| Rebalance freq        | Semi-annual (6ME)                  |
+| Weight method         | Max Sharpe / min drawdown          |
 | Reinvest dividends    | True (reinvest by default)         |
 | Risk-free rate        | 4.5 % annualised                   |
 
 ---
 
-## Strategy: Weight Calibration
+## SQLite Cache
 
-Two methods are supported (set via `METHOD`):
+All downloaded data is cached in a local SQLite database at `data/kin_ai.db`. The cache stores:
 
-### Risk Parity (default)
+| Table | Contents |
+|-------|----------|
+| `prices` | Daily close prices per ticker |
+| `dividends` | Dividend amounts per ticker |
+| `cache_meta` | Timestamps and date ranges for cache validity |
+| `universe` | ETF metadata (ticker, name, asset class, sector) |
 
-Each asset's weight is proportional to the inverse of its historical return volatility — lower-volatility assets receive higher allocations so that every asset contributes a roughly equal share of total portfolio risk.
+Cache entries expire after **12 hours** (`CACHE_EXPIRY_HOURS`). On subsequent runs, prices are served from the local database, making reruns near-instant.
+
+---
+
+## ETF Universe
+
+The investment universe (`universe.py`) contains ~71 ETFs organised by asset class:
+
+| Asset Class | Examples | Count |
+|-------------|----------|-------|
+| US Equity — Broad | SPY, QQQ, IWM, VTI, DIA | 14 |
+| US Equity — Sector | XLF, XLE, XLK, XLV, XBI | 11 |
+| US Equity — Factor | MTUM, QUAL, VLUE, USMV | 4 |
+| International Equity | EFA, EEM, VWO, FXI, EWJ | 9 |
+| Fixed Income | AGG, TLT, HYG, LQD, TIP | 12 |
+| Income / Covered Call | JEPQ, JEPI, XYLD, QYLD, DIVO | 5 |
+| Dividend | VYM, SCHD, DVY, HDV | 4 |
+| Commodity | GLD, SLV, GDX, USO, DBC, PDBC | 6 |
+| Real Estate | VNQ, IYR, XLRE, RWR | 4 |
+| Alternative | BITO, ARKK, TAN, ICLN | 4 |
+
+The universe is saved to the SQLite cache on first run and reloaded from the DB on subsequent runs.
+
+---
+
+## Alpha Model
+
+The alpha model (`alpha.py`) uses five cross-sectional factors to score and rank every ETF in the universe:
+
+| Factor | Weight | Description |
+|--------|--------|-------------|
+| **Momentum** | 40% | 6-month total return (126 trading days) |
+| **Trend** | 20% | Percentage distance from the 200-day SMA |
+| **Low Volatility** | 15% | Inverse of 60-day rolling return volatility |
+| **Mean Reversion** | 10% | Inverted RSI-14 (favours oversold ETFs) |
+| **Dividend Yield** | 15% | Trailing 12-month dividend yield |
+
+### Scoring Process
+
+1. Each factor is computed for all eligible ETFs (those with ≥ `MIN_HISTORY` trading days).
+2. Factors are **z-scored cross-sectionally** (zero mean, unit variance).
+3. The composite alpha is a weighted sum: $\alpha_i = \sum_k w_k \cdot z_{i,k}$
+4. ETFs are ranked by alpha — the top `TOP_N` are selected.
+
+### Look-Ahead-Free Selection
+
+The selector (`selector.py`) builds a callable `selector(date)` that, on each rebalance date, uses **only data up to that date** to compute alpha scores and select ETFs. This prevents any look-ahead bias in the backtest.
+
+---
+
+## Strategy: Weight Optimisation
+
+Three methods are supported (set via `METHOD`):
+
+### Max Sharpe / Min Drawdown (default)
+
+A **Monte-Carlo optimisation** that samples 12,000 random weight vectors and scores each by:
+
+$$
+\text{score} = \text{Sharpe} \;-\; \lambda \times |\text{MaxDrawdown}|
+$$
+
+where $\lambda = 2.0$ (drawdown penalty). The weight vector with the highest score is selected. A **40 % concentration cap** is enforced — any single ETF is capped at `MAX_WEIGHT` with excess redistributed proportionally.
+
+### Risk Parity
+
+Each asset's weight is proportional to the inverse of its historical return volatility:
 
 $$
 w_i = \frac{1 / \sigma_i}{\sum_{j} 1 / \sigma_j}
 $$
-
-where $\sigma_i$ is the daily return standard deviation of asset $i$.
 
 ### Equal Weight
 
@@ -69,10 +160,11 @@ The backtester (`backtest.py`) simulates a **lump-sum** investment with **period
 
 1. On day one the full `initial_cash` amount is deployed across all assets according to the target weights.
 2. Between rebalance dates, holdings are left untouched — asset weights **drift** as prices move.
-3. On each rebalance date (end of every quarter by default), the portfolio is marked-to-market and all positions are **reset to the target weights** by selling/buying at the closing price.
-4. The system records both the portfolio value and the **actual weight of each asset** on every trading day, producing a full weight-drift time series visible in the chart.
+3. On each rebalance date (semi-annual by default), the portfolio is marked-to-market and all positions are **reset to the target weights** by selling/buying at the closing price.
+4. **In auto-select mode**, the selector is called on each rebalance date to pick new ETFs. Holdings in deselected ETFs are sold and proceeds are redeployed into the new picks.
+5. The system records both the portfolio value and the **actual weight of each asset** on every trading day, producing a full weight-drift time series visible in the chart.
 
-Rebalance dates are determined by the pandas offset alias (e.g. `QE` = quarter-end, `ME` = month-end, `YE` = year-end).
+Rebalance dates are determined by the pandas offset alias (e.g. `6ME` = semi-annual, `QE` = quarter-end, `ME` = month-end, `YE` = year-end).
 
 ---
 
@@ -173,7 +265,7 @@ The trend and volatility regimes are combined into a simplified economic cycle l
 
 Based on the detected regime, the advisor (`advice.py`) applies a **regime-based tilt** to the base weights:
 
-- **Bull → Risk-on tilt**: overweight equities (SPY, QQQ, IWM), underweight bonds (AGG) and gold (GLD)
+- **Bull → Risk-on tilt**: overweight equities, underweight bonds and gold
 - **Bear → Risk-off tilt**: overweight bonds and gold, underweight equities
 
 The tilt is capped at `max_tilt = 10%` total, distributed evenly across the assets in each group. Weights are renormalised to sum to 100% after the tilt.
@@ -184,10 +276,11 @@ The tilt is capped at `max_tilt = 10%` total, distributed evenly across the asse
 
 The pipeline produces:
 
-- **Console output** — all statistics, weights, regime, dividends, and advice printed step by step
-- **`portfolio.png`** — Bloomberg-style dark-theme chart with four panels:
+- **Console output** — all statistics, alpha scores, weights, regime, dividends, and advice printed step by step
+- **`portfolio.png`** — Bloomberg-style dark-theme chart with five panels:
   - Portfolio value over time (with start/end labels)
-  - Stacked-area allocation weights (showing drift between rebalance dates)
+  - Cumulative dividends chart
+  - Stacked-area allocation weights with **per-rebalance ETF annotations** centred in each band
   - Drawdown chart (worst drawdown annotated)
   - Key statistics sidebar (CAGR, Sharpe, max DD, Calmar, win rate, dividends, regime, cycle, action)
 
@@ -197,20 +290,26 @@ The pipeline produces:
 
 ```
 kin-ai/
-├── main.py                  # Root entry point (delegates to kin_ai.main)
-├── requirements.txt         # numpy, pandas, yfinance, matplotlib
+├── main.py                   # Root entry point (delegates to kin_ai.main)
+├── requirements.txt          # numpy, pandas, yfinance, matplotlib
 ├── pyproject.toml
+├── .gitignore
+├── portfolio.png             # Generated chart (sample above)
 ├── kin_ai/
 │   ├── __init__.py
-│   ├── main.py              # Pipeline orchestrator + chart rendering
+│   ├── main.py               # Pipeline orchestrator + Bloomberg chart
 │   └── src/
 │       ├── __init__.py
-│       ├── data.py           # Yahoo Finance data download
-│       ├── strategy.py       # Weight calibration (risk-parity / equal-weight)
-│       ├── backtest.py       # Lump-sum backtester with rebalancing
-│       ├── regime.py         # Market regime + economic cycle detection
-│       ├── advice.py         # Tactical allocation advice
-│       └── run_pipeline.py   # Alternate entry point
+│       ├── cache.py           # SQLite cache (prices, dividends, universe)
+│       ├── universe.py        # ETF universe definition (~71 ETFs)
+│       ├── alpha.py           # Multi-factor alpha scoring model
+│       ├── selector.py        # Look-ahead-free ETF picker
+│       ├── data.py            # Yahoo Finance data download (cache-first)
+│       ├── strategy.py        # Weight optimisation (max-Sharpe, risk-parity, equal)
+│       ├── backtest.py        # Lump-sum backtester with dynamic selection
+│       ├── regime.py          # Market regime + economic cycle detection
+│       ├── advice.py          # Tactical allocation advice
+│       └── run_pipeline.py    # Alternate entry point
 ```
 
 ---
@@ -232,5 +331,24 @@ python -m pip install -r requirements.txt
 python -m kin_ai.main
 ```
 
-The chart is saved to `portfolio.png` in the project root.
+The chart is saved to `portfolio.png` in the project root. On first run, prices for ~71 ETFs are downloaded and cached to `data/kin_ai.db`. Subsequent runs load from cache in seconds.
+
+### Auto-Select Mode
+
+To let the alpha model pick ETFs automatically, edit `kin_ai/main.py`:
+
+```python
+AUTO_SELECT = True
+TOP_N = 4
+MAX_WEIGHT = 0.40
+```
+
+### Manual Mode (default)
+
+Use a fixed set of tickers:
+
+```python
+AUTO_SELECT = False
+TICKERS = ["HYG", "TLH", "JEPQ", "JEPI", "QQQ"]
+```
 

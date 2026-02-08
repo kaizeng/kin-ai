@@ -14,9 +14,9 @@ env/
 # Data & models (large files)
 data/
 models/
+*.db
 
 # Reports / generated
-portfolio.png
 reports/
 
 # OS

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, NamedTuple, Optional
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -13,6 +13,7 @@ class BacktestResult(NamedTuple):
     total_dividends: float          # cumulative dividends received
     dividend_cash: pd.Series        # running cash balance from dividends (cash-out mode)
     cumulative_dividends: pd.Series # running total of all dividends received
+    selection_log: list             # list of (date, selected_tickers) on each rebalance
 
 
 def backtest_lump_sum(
@@ -22,6 +23,7 @@ def backtest_lump_sum(
     rebalance_freq: str = "QE",
     dividends: Optional[pd.DataFrame] = None,
     reinvest_dividends: bool = True,
+    selector: Optional[Callable] = None,
 ) -> BacktestResult:
     """Backtest a lump-sum investment with periodic rebalancing.
 
@@ -30,7 +32,8 @@ def backtest_lump_sum(
     prices : DataFrame
         Daily close prices (columns = tickers).
     weights : dict
-        Target allocation weights.
+        Target allocation weights (used for first deployment and when
+        no selector is provided).
     initial_cash : float
         Starting capital.
     rebalance_freq : str
@@ -41,11 +44,15 @@ def backtest_lump_sum(
     reinvest_dividends : bool
         If True, dividends buy additional shares on the ex-date.
         If False, dividends accumulate as a separate cash balance.
+    selector : callable or None
+        If provided, called as ``selector(date)`` on each rebalance date.
+        Must return ``(selected_tickers, weights_dict)``.
+        This enables dynamic ETF selection (auto-pick mode).
 
     Returns
     -------
     BacktestResult
-        Named tuple with (portfolio, weights, total_dividends, dividend_cash).
+        Named tuple with portfolio, weights, dividends, selection_log.
     """
     prices = prices.dropna()
     weights = {k: v for k, v in weights.items() if k in prices.columns}
@@ -75,8 +82,11 @@ def backtest_lump_sum(
     weight_records = []
     cash_values = []
     cum_div_values = []
+    selection_log: list = []
 
     first_day = True
+    # Track current target weights as a Series aligned to prices.columns
+    w_current = w.copy()
 
     for dt, row in prices.iterrows():
         # ── Collect dividends for today ──────────────────────
@@ -88,7 +98,7 @@ def backtest_lump_sum(
             if div_income > 0:
                 if reinvest_dividends:
                     # Buy more shares at today's price
-                    new_shares = (div_income * w) / row
+                    new_shares = (div_income * w_current) / row
                     # Guard against zero-price division
                     new_shares = new_shares.fillna(0.0).replace([np.inf, -np.inf], 0.0)
                     holdings = holdings + new_shares
@@ -97,11 +107,37 @@ def backtest_lump_sum(
 
         # ── Rebalance (always deploy on first day) ───────────
         if first_day or dt in rebal_dates:
+            # Dynamic selection: ask the selector for new picks
+            if selector is not None:
+                try:
+                    sel_tickers, sel_weights = selector(dt)
+                    # Update w_current to reflect new selection
+                    w_current = pd.Series(0.0, index=prices.columns)
+                    for t_sel, w_sel in sel_weights.items():
+                        if t_sel in w_current.index:
+                            w_current[t_sel] = w_sel
+                    if w_current.sum() > 0:
+                        w_current = w_current / w_current.sum()
+                    selection_log.append((dt, sel_tickers))
+                except Exception:
+                    pass  # keep previous weights on failure
+
             if holdings.sum() == 0:
                 target_value = initial_cash
             else:
                 target_value = (holdings * row).sum()
-            holdings = (target_value * w) / row
+
+            # Zero out holdings in tickers we no longer want
+            for col in prices.columns:
+                if w_current[col] == 0:
+                    holdings[col] = 0.0
+
+            # Allocate to tickers with non-zero weight
+            active = w_current[w_current > 0]
+            if not active.empty:
+                for t_a in active.index:
+                    if row[t_a] > 0:
+                        holdings[t_a] = (target_value * w_current[t_a]) / row[t_a]
             first_day = False
 
         # ── Mark to market ───────────────────────────────────
@@ -128,4 +164,5 @@ def backtest_lump_sum(
         total_dividends=total_divs_received,
         dividend_cash=cv,
         cumulative_dividends=cd,
+        selection_log=selection_log,
     )

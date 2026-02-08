@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import matplotlib.dates as mdates
@@ -10,20 +11,32 @@ from matplotlib.patches import FancyBboxPatch
 from datetime import datetime
 
 from kin_ai.src.data import get_price_data, get_dividend_data
+from kin_ai.src.cache import init_db
 from kin_ai.src.strategy import calibrate_etf_plan
 from kin_ai.src.backtest import backtest_lump_sum
 from kin_ai.src.regime import detect_market_regime, infer_economic_cycle
 from kin_ai.src.advice import generate_advice
+from kin_ai.src.universe import (
+    get_all_tickers, save_universe_to_db, load_universe_from_db,
+)
+from kin_ai.src.alpha import compute_alpha
+from kin_ai.src.selector import build_selector_fn
 
 # ── Default parameters ──────────────────────────────────────────
-TICKERS = ["HYG","TLH","JEPQ"]
+TICKERS = ["HYG", "TLH", "JEPQ","JEPI","QQQ"]        # used only if AUTO_SELECT = False
 START = "2020-01-01"
-END = "2025-12-31"
+END = "2026-02-07"
 INITIAL_CASH = 10_000.0
-REBALANCE_FREQ = "QE"
-METHOD = "risk_parity"
-REINVEST_DIVIDENDS = True      # True = reinvest, False = cash out
-RISK_FREE_RATE = 0.045         # annualised risk-free rate (4.5 %)
+REBALANCE_FREQ = "6ME"
+METHOD = "max_sharpe"
+REINVEST_DIVIDENDS = True
+RISK_FREE_RATE = 0.045
+
+# ── Auto-selection parameters ───────────────────────────────────
+AUTO_SELECT = False              # True = alpha-driven ETF selection
+TOP_N = 4                       # number of ETFs to hold
+MAX_WEIGHT = 0.40               # max single-ETF weight (concentration cap)
+MIN_HISTORY = 200               # minimum trading days for eligibility
 
 
 def main() -> None:
@@ -31,36 +44,83 @@ def main() -> None:
     print("  Kin-AI  –  Investment Research Pipeline")
     print("=" * 60)
 
-    # 1. Fetch prices (adjusted for splits only, not dividends)
-    print(f"\n[1/6] Downloading prices for {TICKERS} ({START} → {END}) …")
-    prices = get_price_data(TICKERS, start=START, end=END, auto_adjust=True)
-    print(f"      Got {len(prices)} trading days, {len(prices.columns)} tickers.")
+    init_db()
+    mode = "AUTO-SELECT" if AUTO_SELECT else "MANUAL"
+    print(f"\n  Mode: {mode}")
 
-    # 2. Fetch dividends
+    # ── Step 1: Universe / Prices ─────────────────────────────
+    if AUTO_SELECT:
+        print("\n[1/8] Loading ETF universe & downloading prices …")
+        n_saved = save_universe_to_db()
+        universe_df = load_universe_from_db()
+        all_tickers = universe_df["ticker"].tolist()
+        print(f"      Universe: {n_saved} ETFs across "
+              f"{universe_df['asset_class'].nunique()} asset classes.")
+
+        # Download full universe prices (cache speeds up reruns)
+        prices_all = get_price_data(all_tickers, start=START, end=END, auto_adjust=True)
+        # Drop tickers that returned no data
+        prices_all = prices_all.dropna(axis=1, how="all")
+        active_tickers = prices_all.columns.tolist()
+        print(f"      Got {len(prices_all)} trading days, "
+              f"{len(active_tickers)} tickers with data.")
+    else:
+        print(f"\n[1/8] Downloading prices for {TICKERS} ({START} → {END}) …")
+        prices_all = get_price_data(TICKERS, start=START, end=END, auto_adjust=True)
+        active_tickers = TICKERS
+        print(f"      Got {len(prices_all)} trading days, "
+              f"{len(prices_all.columns)} tickers.")
+
+    # ── Step 2: Dividends ─────────────────────────────────────
     div_mode = "reinvest" if REINVEST_DIVIDENDS else "cash out"
-    print(f"\n[2/6] Downloading dividend history (mode: {div_mode}) …")
-    dividends = get_dividend_data(TICKERS, start=START, end=END)
-    total_div_events = (dividends > 0).sum().sum()
-    print(f"      Found {total_div_events} ex-dividend events across {len(TICKERS)} tickers.")
+    print(f"\n[2/8] Downloading dividend history (mode: {div_mode}) …")
+    dividends_all = get_dividend_data(active_tickers, start=START, end=END)
+    total_div_events = (dividends_all > 0).sum().sum()
+    print(f"      Found {total_div_events} ex-dividend events.")
 
-    # 3. Calibrate strategy
-    print(f"\n[3/6] Calibrating weights (method={METHOD}) …")
-    weights = calibrate_etf_plan(prices, method=METHOD)
-    for t, w in sorted(weights.items(), key=lambda x: -x[1]):
-        print(f"      {t:>5s}  {w:6.2%}")
+    # ── Step 3: Alpha scoring (auto-select only) ──────────────
+    selector_fn = None
+    if AUTO_SELECT:
+        print(f"\n[3/8] Running alpha model (top {TOP_N} ETFs per rebalance) …")
+        # Show current scores for info
+        current_scores = compute_alpha(prices_all, dividends_all)
+        top5_now = current_scores.head(TOP_N)
+        for t in top5_now.index:
+            row = top5_now.loc[t]
+            print(f"      {t:>5s}  α={row['alpha']:+.2f}  "
+                  f"(mom={row['momentum']:+.2f}  trend={row['trend']:+.2f}  "
+                  f"vol={row['low_vol']:+.2f}  mr={row['mean_reversion']:+.2f}  "
+                  f"div={row['dividend_yield']:+.2f})")
+        selector_fn = build_selector_fn(
+            prices_all, dividends_all,
+            top_n=TOP_N, min_history=MIN_HISTORY,
+            max_weight=MAX_WEIGHT, weight_method=METHOD,
+        )
+        # Use the current top picks as initial weights
+        initial_tickers = top5_now.index.tolist()
+        weights = {t: 1.0 / len(initial_tickers) for t in initial_tickers}
+        print(f"      Initial picks: {initial_tickers}")
+    else:
+        print(f"\n[3/8] Calibrating weights (method={METHOD}) …")
+        weights = calibrate_etf_plan(prices_all[TICKERS], method=METHOD)
+        for t, w in sorted(weights.items(), key=lambda x: -x[1]):
+            print(f"      {t:>5s}  {w:6.2%}")
 
-    # 4. Backtest
-    print(f"\n[4/6] Backtesting lump-sum ${INITIAL_CASH:,.0f}, rebalance every {REBALANCE_FREQ} …")
+    # ── Step 4: Backtest ──────────────────────────────────────
+    print(f"\n[4/8] Backtesting lump-sum ${INITIAL_CASH:,.0f}, "
+          f"rebalance every {REBALANCE_FREQ} …")
     result = backtest_lump_sum(
-        prices, weights, INITIAL_CASH, REBALANCE_FREQ,
-        dividends=dividends,
+        prices_all, weights, INITIAL_CASH, REBALANCE_FREQ,
+        dividends=dividends_all,
         reinvest_dividends=REINVEST_DIVIDENDS,
+        selector=selector_fn,
     )
     portfolio = result.portfolio
     weight_history = result.weights
     total_divs = result.total_dividends
     dividend_cash = result.dividend_cash
     cum_divs = result.cumulative_dividends
+    selection_log = result.selection_log
 
     print(f"      Final value: ${portfolio.iloc[-1]:,.2f}")
     total_return = (portfolio.iloc[-1] / INITIAL_CASH - 1) * 100
@@ -69,10 +129,16 @@ def main() -> None:
     if not REINVEST_DIVIDENDS:
         print(f"      Dividend cash balance: ${dividend_cash.iloc[-1]:,.2f}")
 
-    # 5. Detect regime (always use SPY, download separately if needed)
-    print("\n[5/6] Detecting market regime (SPY) …")
-    if "SPY" in prices.columns:
-        spy_prices = prices["SPY"]
+    if selection_log:
+        print(f"      Rebalances with selection: {len(selection_log)}")
+        # Show last selection
+        last_dt, last_picks = selection_log[-1]
+        print(f"      Last selection ({last_dt.strftime('%Y-%m-%d')}): {last_picks}")
+
+    # ── Step 5: Detect regime ─────────────────────────────────
+    print("\n[5/8] Detecting market regime (SPY) …")
+    if "SPY" in prices_all.columns:
+        spy_prices = prices_all["SPY"]
     else:
         spy_data = get_price_data(["SPY"], start=START, end=END, auto_adjust=True)
         spy_prices = spy_data["SPY"]
@@ -80,9 +146,12 @@ def main() -> None:
     cycle = infer_economic_cycle(trend, vol)
     print(f"      Trend: {trend}  |  Volatility: {vol}  |  Cycle: {cycle}")
 
-    # 6. Generate advice
-    print("\n[6/6] Generating allocation advice …")
-    advice = generate_advice(trend, cycle, weights)
+    # ── Step 6: Generate advice ───────────────────────────────
+    print("\n[6/8] Generating allocation advice …")
+    # Use most recent weights from the backtest
+    last_weights = weight_history.iloc[-1].to_dict()
+    last_weights = {k: v for k, v in last_weights.items() if v > 0.001}
+    advice = generate_advice(trend, cycle, last_weights)
     print(f"      Action: {advice['action']}")
     print("      Suggested weights:")
     for t, w in sorted(advice["suggested_weights"].items(), key=lambda x: -x[1]):
@@ -117,7 +186,7 @@ def main() -> None:
     div_yield = (total_divs / INITIAL_CASH / years) * 100  # avg annual div yield on cost
 
     # ── Bloomberg-style chart ──────────────────────────────────
-    print("\n      Saving portfolio chart to portfolio.png …")
+    print("\n[7/8] Saving portfolio chart to portfolio.png …")
 
     # Dark theme colors
     BG = "#1a1a2e"
@@ -246,6 +315,10 @@ def main() -> None:
     ax_divs.set_ylim(bottom=0)
 
     # ── Weights time-series (stacked area) ────────────────────
+    # Only show tickers that were actually held at some point
+    held_cols = [c for c in weight_history.columns if weight_history[c].max() > 0.001]
+    wh_display = weight_history[held_cols] if held_cols else weight_history
+
     # Dynamic color palette — assign a distinct color to every ticker
     _COLOR_POOL = [
         "#00aeff", "#a855f7", "#00d26a", "#ff9500", "#ffd700",
@@ -255,10 +328,10 @@ def main() -> None:
     ]
     ASSET_COLORS = {
         t: _COLOR_POOL[i % len(_COLOR_POOL)]
-        for i, t in enumerate(sorted(weight_history.columns))
+        for i, t in enumerate(sorted(wh_display.columns))
     }
     # Resample to weekly for smoother visual
-    wt_weekly = weight_history.resample("W").last().dropna()
+    wt_weekly = wh_display.resample("W").last().dropna()
     # Sort columns by mean weight descending for a cleaner stack
     col_order = wt_weekly.mean().sort_values(ascending=False).index.tolist()
     wt_plot = wt_weekly[col_order] * 100  # percent
@@ -266,7 +339,7 @@ def main() -> None:
     colors = [ASSET_COLORS.get(c, MUTED) for c in col_order]
     ax_wt.stackplot(
         wt_plot.index, *[wt_plot[c].values for c in col_order],
-        labels=col_order, colors=colors, alpha=0.85, linewidth=0,
+        colors=colors, alpha=0.85, linewidth=0,
     )
     # Thin white separator lines between areas for clarity
     cumulative = np.zeros(len(wt_plot))
@@ -274,17 +347,49 @@ def main() -> None:
         cumulative = cumulative + wt_plot[c].values
         ax_wt.plot(wt_plot.index, cumulative, color=PANEL, linewidth=0.3)
 
+    # ── Inline annotations at each rebalance showing ETF names + weights ──
+    # Collect rebalance dates from selection_log (auto-select) or weight shifts
+    if selection_log:
+        rebal_dates_for_labels = [dt for dt, _ in selection_log]
+    else:
+        # Manual mode: detect rebalance dates from weight jumps
+        wdiff = wh_display.diff().abs().sum(axis=1)
+        rebal_dates_for_labels = wdiff[wdiff > 0.01].index.tolist()
+
+    # Find the nearest weekly index for each rebalance date
+    wt_idx = wt_plot.index
+    for rdate in rebal_dates_for_labels:
+        # Snap to the closest weekly sample
+        dists = abs(wt_idx - rdate)
+        snap_idx = dists.argmin()
+        snap_date = wt_idx[snap_idx]
+
+        # Draw a thin vertical rebalance marker
+        ax_wt.axvline(snap_date, color=MUTED, linewidth=0.4, alpha=0.5, zorder=2)
+
+        # Place each ETF label centred within its own band
+        cum_bottom = 0.0
+        for c in col_order:
+            v = wt_plot[c].iloc[snap_idx]
+            band_top = cum_bottom + v
+            mid_y = (cum_bottom + band_top) / 2
+            cum_bottom = band_top
+            if v < 4:  # skip bands too thin to read
+                continue
+            ax_wt.text(
+                snap_date, mid_y, f"{c}\n{v:.0f}%",
+                fontsize=4.8, fontfamily="monospace", fontweight="bold",
+                color=WHITE, ha="center", va="center", zorder=12,
+                bbox=dict(boxstyle="round,pad=0.15",
+                          facecolor=ASSET_COLORS.get(c, MUTED),
+                          edgecolor="none", alpha=0.7),
+            )
+
     ax_wt.set_ylabel("ALLOCATION  (%)", fontsize=9, labelpad=10)
     ax_wt.set_ylim(0, 100)
     ax_wt.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:.0f}%"))
     ax_wt.grid(True, color=GRID, linewidth=0.5, alpha=0.4)
     ax_wt.tick_params(axis="x", labelbottom=False)
-    ax_wt.legend(
-        loc="upper center", ncol=len(col_order),
-        fontsize=8, frameon=False,
-        bbox_to_anchor=(0.5, 1.12),
-        labelcolor=WHITE,
-    )
 
     # ── Drawdown chart ─────────────────────────────────────────
     ax_dd.fill_between(
@@ -389,15 +494,16 @@ def main() -> None:
     ax_footer.axis("off")
     tickers_str = " | ".join(
         f"{t} {w:.0%}" for t, w in sorted(
-            advice["suggested_weights"].items(), key=lambda x: -x[1]
+            last_weights.items(), key=lambda x: -x[1]
         )
     )
+    mode_label = f"AUTO (top {TOP_N})" if AUTO_SELECT else METHOD.upper().replace('_', ' ')
     ax_footer.text(
         0.0, 0.5,
-        f"TICKERS:  {tickers_str}     │     PERIOD: {START} → {END}"
+        f"HOLDINGS:  {tickers_str}     │     PERIOD: {START} → {END}"
         f"     │     INITIAL: ${INITIAL_CASH:,.0f}     │     REBAL: {REBALANCE_FREQ}"
         f"     │     DIVIDENDS: {'REINVEST' if REINVEST_DIVIDENDS else 'CASH OUT'}"
-        f"     │     METHOD: {METHOD.upper().replace('_', ' ')}",
+        f"     │     MODE: {mode_label}",
         fontsize=8, color=MUTED, va="center", fontfamily="monospace",
     )
     ax_footer.text(
@@ -409,6 +515,19 @@ def main() -> None:
     fig.savefig("portfolio.png", dpi=200, facecolor=BG)
     plt.close(fig)
     print("      Done ✓")
+
+    # ── Step 8: Summary ───────────────────────────────────────
+    print(f"\n[8/8] Summary")
+    print(f"      Mode:         {mode}")
+    print(f"      Final value:  ${portfolio.iloc[-1]:,.2f}")
+    print(f"      Total return: {total_return:+.1f}%")
+    print(f"      CAGR:         {cagr:+.1f}%")
+    print(f"      Sharpe:       {sharpe:.2f}")
+    print(f"      Max DD:       {max_dd:.1f}%")
+    if AUTO_SELECT and selection_log:
+        last_dt, last_picks = selection_log[-1]
+        print(f"      Holdings:     {last_picks}")
+    print(f"      Chart saved:  portfolio.png")
     print("=" * 60)
 
 
