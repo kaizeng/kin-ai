@@ -16,8 +16,8 @@ from kin_ai.src.regime import detect_market_regime, infer_economic_cycle
 from kin_ai.src.advice import generate_advice
 
 # ── Default parameters ──────────────────────────────────────────
-TICKERS = ["SPY", "QQQ", "IWM", "AGG", "GLD"]
-START = "2015-01-01"
+TICKERS = ["HYG","TLH","JEPQ"]
+START = "2020-01-01"
 END = "2025-12-31"
 INITIAL_CASH = 10_000.0
 REBALANCE_FREQ = "QE"
@@ -60,6 +60,7 @@ def main() -> None:
     weight_history = result.weights
     total_divs = result.total_dividends
     dividend_cash = result.dividend_cash
+    cum_divs = result.cumulative_dividends
 
     print(f"      Final value: ${portfolio.iloc[-1]:,.2f}")
     total_return = (portfolio.iloc[-1] / INITIAL_CASH - 1) * 100
@@ -68,9 +69,14 @@ def main() -> None:
     if not REINVEST_DIVIDENDS:
         print(f"      Dividend cash balance: ${dividend_cash.iloc[-1]:,.2f}")
 
-    # 5. Detect regime
+    # 5. Detect regime (always use SPY, download separately if needed)
     print("\n[5/6] Detecting market regime (SPY) …")
-    trend, vol = detect_market_regime(prices["SPY"])
+    if "SPY" in prices.columns:
+        spy_prices = prices["SPY"]
+    else:
+        spy_data = get_price_data(["SPY"], start=START, end=END, auto_adjust=True)
+        spy_prices = spy_data["SPY"]
+    trend, vol = detect_market_regime(spy_prices)
     cycle = infer_economic_cycle(trend, vol)
     print(f"      Trend: {trend}  |  Volatility: {vol}  |  Cycle: {cycle}")
 
@@ -137,22 +143,23 @@ def main() -> None:
 
     fig = plt.figure(figsize=(16, 13), facecolor=BG)
 
-    # Layout: portfolio, weights, drawdown, footer + stats sidebar
+    # Layout: portfolio, dividends, weights, drawdown, footer + stats sidebar
     gs = fig.add_gridspec(
-        4, 2,
+        5, 2,
         width_ratios=[3, 1],
-        height_ratios=[3.5, 2, 1.2, 0.3],
+        height_ratios=[3.0, 1.2, 1.8, 1.0, 0.3],
         hspace=0.08, wspace=0.02,
         left=0.06, right=0.97, top=0.93, bottom=0.04,
     )
 
     ax_main = fig.add_subplot(gs[0, 0])
-    ax_wt = fig.add_subplot(gs[1, 0], sharex=ax_main)
-    ax_dd = fig.add_subplot(gs[2, 0], sharex=ax_main)
-    ax_stats = fig.add_subplot(gs[0:3, 1])
-    ax_footer = fig.add_subplot(gs[3, :])
+    ax_divs = fig.add_subplot(gs[1, 0], sharex=ax_main)
+    ax_wt = fig.add_subplot(gs[2, 0], sharex=ax_main)
+    ax_dd = fig.add_subplot(gs[3, 0], sharex=ax_main)
+    ax_stats = fig.add_subplot(gs[0:4, 1])
+    ax_footer = fig.add_subplot(gs[4, :])
 
-    for ax in [ax_main, ax_wt, ax_dd, ax_stats, ax_footer]:
+    for ax in [ax_main, ax_divs, ax_wt, ax_dd, ax_stats, ax_footer]:
         ax.set_facecolor(PANEL)
         for spine in ax.spines.values():
             spine.set_color(GRID)
@@ -212,11 +219,43 @@ def main() -> None:
         fontsize=10, fontweight="bold", color=GREEN, va="bottom",
     )
 
+    # ── Cumulative dividends subplot ───────────────────────────
+    GOLD = "#ffd700"
+    ax_divs.fill_between(
+        cum_divs.index, cum_divs.values,
+        alpha=0.20, color=GOLD, linewidth=0,
+    )
+    ax_divs.plot(
+        cum_divs.index, cum_divs.values,
+        color=GOLD, linewidth=1.4, zorder=5,
+    )
+    # highlight final value
+    ax_divs.scatter(
+        [cum_divs.index[-1]], [cum_divs.iloc[-1]],
+        color=GOLD, s=30, zorder=6, edgecolors=WHITE, linewidths=0.8,
+    )
+    ax_divs.text(
+        cum_divs.index[-1], cum_divs.iloc[-1],
+        f"  ${cum_divs.iloc[-1]:,.0f}",
+        fontsize=9, fontweight="bold", color=GOLD, va="bottom",
+    )
+    ax_divs.set_ylabel("CUM. DIVIDENDS  (USD)", fontsize=9, labelpad=10)
+    ax_divs.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+    ax_divs.grid(True, color=GRID, linewidth=0.5, alpha=0.4)
+    ax_divs.tick_params(axis="x", labelbottom=False)
+    ax_divs.set_ylim(bottom=0)
+
     # ── Weights time-series (stacked area) ────────────────────
-    # Asset color palette
+    # Dynamic color palette — assign a distinct color to every ticker
+    _COLOR_POOL = [
+        "#00aeff", "#a855f7", "#00d26a", "#ff9500", "#ffd700",
+        "#f8312f", "#00e5ff", "#ff6ec7", "#1abc9c", "#e74c3c",
+        "#3498db", "#e67e22", "#9b59b6", "#2ecc71", "#f39c12",
+        "#e84393", "#6c5ce7", "#00cec9", "#fd79a8", "#55efc4",
+    ]
     ASSET_COLORS = {
-        "SPY": "#00aeff", "QQQ": "#a855f7", "IWM": "#00d26a",
-        "AGG": "#ff9500", "GLD": "#ffd700",
+        t: _COLOR_POOL[i % len(_COLOR_POOL)]
+        for i, t in enumerate(sorted(weight_history.columns))
     }
     # Resample to weekly for smoother visual
     wt_weekly = weight_history.resample("W").last().dropna()

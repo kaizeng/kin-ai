@@ -12,6 +12,7 @@ class BacktestResult(NamedTuple):
     weights: pd.DataFrame           # actual asset weights over time
     total_dividends: float          # cumulative dividends received
     dividend_cash: pd.Series        # running cash balance from dividends (cash-out mode)
+    cumulative_dividends: pd.Series # running total of all dividends received
 
 
 def backtest_lump_sum(
@@ -73,6 +74,9 @@ def backtest_lump_sum(
     portfolio_values = []
     weight_records = []
     cash_values = []
+    cum_div_values = []
+
+    first_day = True
 
     for dt, row in prices.iterrows():
         # ── Collect dividends for today ──────────────────────
@@ -91,19 +95,21 @@ def backtest_lump_sum(
                 else:
                     cash_balance += div_income
 
-        # ── Rebalance ────────────────────────────────────────
-        if dt in rebal_dates:
+        # ── Rebalance (always deploy on first day) ───────────
+        if first_day or dt in rebal_dates:
             if holdings.sum() == 0:
                 target_value = initial_cash
             else:
                 target_value = (holdings * row).sum()
             holdings = (target_value * w) / row
+            first_day = False
 
         # ── Mark to market ───────────────────────────────────
         invested_value = (holdings * row).sum()
         port_val = invested_value + (0.0 if reinvest_dividends else cash_balance)
         portfolio_values.append(port_val)
         cash_values.append(cash_balance)
+        cum_div_values.append(total_divs_received)
 
         # Record actual asset weights (excluding cash)
         if invested_value > 0:
@@ -114,10 +120,12 @@ def backtest_lump_sum(
     pv = pd.Series(portfolio_values, index=prices.index, name="portfolio_value")
     wt = pd.DataFrame(weight_records, index=prices.index)
     cv = pd.Series(cash_values, index=prices.index, name="dividend_cash")
+    cd = pd.Series(cum_div_values, index=prices.index, name="cumulative_dividends")
 
     return BacktestResult(
         portfolio=pv,
         weights=wt,
         total_dividends=total_divs_received,
         dividend_cash=cv,
+        cumulative_dividends=cd,
     )
